@@ -21,92 +21,27 @@
 #include "driver/gpio.h"
 #include "sdkconfig.h"
 
-// Choose the default phy config according to Kconfig
-#if CONFIG_EXAMPLE_PHY_LAN8720
-#include "eth_phy/phy_lan8720.h"
-#define DEFAULT_ETHERNET_PHY_CONFIG phy_lan8720_default_ethernet_config
-#elif CONFIG_EXAMPLE_PHY_TLK110
-#include "eth_phy/phy_tlk110.h"
-#define DEFAULT_ETHERNET_PHY_CONFIG phy_tlk110_default_ethernet_config
-#elif CONFIG_EXAMPLE_PHY_IP101
-#include "eth_phy/phy_ip101.h"
-#define DEFAULT_ETHERNET_PHY_CONFIG phy_ip101_default_ethernet_config
-#endif
+static const char *TAG = "eth_example";
+static esp_eth_handle_t s_eth_handle = NULL;
+static xQueueHandle flow_control_queue = NULL;
+static bool s_sta_is_connected = false;
+static bool s_ethernet_is_connected = false;
+static uint8_t s_eth_mac[6];
 
 #define FLOW_CONTROL_QUEUE_TIMEOUT_MS (100)
-#define FLOW_CONTROL_QUEUE_LENGTH (10)
+#define FLOW_CONTROL_QUEUE_LENGTH (40)
 #define FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS (100)
-
-static const char *TAG = "example";
 
 typedef struct {
     void *packet;
     uint16_t length;
 } flow_control_msg_t;
 
-static xQueueHandle flow_control_queue = NULL;
-
-static bool s_sta_is_connected = false;
-static bool s_ethernet_is_connected = false;
-static uint8_t s_eth_mac[6];
-
-#ifdef CONFIG_EXAMPLE_PHY_USE_POWER_PIN
-/**
- * @brief power control function for phy
- *
- * @param enable: set true to enable PHY power, set false to disable PHY power
- *
- * @note This function replaces the default PHY power on/off function.
- * If this GPIO is not connected on your device (and PHY is always powered),
- * you can use the default PHY-specific power on/off function.
- */
-static void phy_device_power_enable_via_gpio(bool enable)
-{
-    assert(DEFAULT_ETHERNET_PHY_CONFIG.phy_power_enable);
-    if (!enable) {
-        /* call the default PHY-specific power off function */
-        DEFAULT_ETHERNET_PHY_CONFIG.phy_power_enable(false);
-    }
-    gpio_pad_select_gpio(CONFIG_EXAMPLE_PHY_POWER_PIN);
-    gpio_set_direction(CONFIG_EXAMPLE_PHY_POWER_PIN, GPIO_MODE_OUTPUT);
-    if (enable) {
-        gpio_set_level(CONFIG_EXAMPLE_PHY_POWER_PIN, 1);
-        ESP_LOGI(TAG, "Power On Ethernet PHY");
-    } else {
-        gpio_set_level(CONFIG_EXAMPLE_PHY_POWER_PIN, 0);
-        ESP_LOGI(TAG, "Power Off Ethernet PHY");
-    }
-    vTaskDelay(1);
-    if (enable) {
-        /* call the default PHY-specific power on function */
-        DEFAULT_ETHERNET_PHY_CONFIG.phy_power_enable(true);
-    }
-}
-#endif
-
-/**
- * @brief gpio specific init
- *
- * @note RMII data pins are fixed in esp32 as follows:
- * TXD0 <=> GPIO19
- * TXD1 <=> GPIO22
- * TX_EN <=> GPIO21
- * RXD0 <=> GPIO25
- * RXD1 <=> GPIO26
- * CLK <=> GPIO0
- *
- */
-static void eth_gpio_config_rmii(void)
-{
-    phy_rmii_configure_data_interface_pins();
-    phy_rmii_smi_configure_pins(CONFIG_EXAMPLE_PHY_SMI_MDC_PIN, CONFIG_EXAMPLE_PHY_SMI_MDIO_PIN);
-}
-
 // Forward packets from Wi-Fi to Ethernet
 static esp_err_t pkt_wifi2eth(void *buffer, uint16_t len, void *eb)
 {
     if (s_ethernet_is_connected) {
-        if (esp_eth_tx(buffer, len) != ESP_OK) {
+        if (esp_eth_transmit(s_eth_handle, buffer, len) != ESP_OK) {
             ESP_LOGE(TAG, "Ethernet send packet failed");
         }
     }
@@ -117,7 +52,7 @@ static esp_err_t pkt_wifi2eth(void *buffer, uint16_t len, void *eb)
 // Forward packets from Ethernet to Wi-Fi
 // Note that, Ethernet works faster than Wi-Fi on ESP32,
 // so we need to add an extra queue to balance their speed difference.
-static esp_err_t pkt_eth2wifi(void *buffer, uint16_t len, void *eb)
+static esp_err_t pkt_eth2wifi(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t len)
 {
     esp_err_t ret = ESP_OK;
     flow_control_msg_t msg = {
@@ -126,6 +61,7 @@ static esp_err_t pkt_eth2wifi(void *buffer, uint16_t len, void *eb)
     };
     if (xQueueSend(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "send flow control message failed or timeout");
+        free(buffer);
         ret = ESP_FAIL;
     }
     return ret;
@@ -141,17 +77,17 @@ static void eth2wifi_flow_control_task(void *args)
     while (1) {
         if (xQueueReceive(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) == pdTRUE) {
             timeout = 0;
-            if (s_sta_is_connected && msg.length > 4) {
+            if (s_sta_is_connected && msg.length) {
                 do {
                     vTaskDelay(pdMS_TO_TICKS(timeout));
                     timeout += 2;
-                    res = esp_wifi_internal_tx(ESP_IF_WIFI_AP, msg.packet, msg.length - 4);
-                } while (res == -1 && timeout < FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS);
+                    res = esp_wifi_internal_tx(ESP_IF_WIFI_AP, msg.packet, msg.length);
+                } while (res && timeout < FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS);
                 if (res != ESP_OK) {
                     ESP_LOGE(TAG, "WiFi send packet failed: %d", res);
                 }
             }
-            esp_eth_free_rx_buf(msg.packet);
+            free(msg.packet);
         }
     }
     vTaskDelete(NULL);
@@ -165,7 +101,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
     case ETHERNET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Ethernet Link Up");
         s_ethernet_is_connected = true;
-        esp_eth_get_mac(s_eth_mac);
+        esp_eth_ioctl(s_eth_handle, ETH_CMD_G_MAC_ADDR, s_eth_mac);
         esp_wifi_set_mac(WIFI_IF_AP, s_eth_mac);
         ESP_ERROR_CHECK(esp_wifi_start());
         break;
@@ -207,25 +143,29 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 static void initialize_ethernet(void)
 {
-    eth_config_t config = DEFAULT_ETHERNET_PHY_CONFIG;
-    config.phy_addr = CONFIG_EXAMPLE_PHY_ADDRESS;
-    config.gpio_config = eth_gpio_config_rmii;
-    config.clock_mode = CONFIG_EXAMPLE_PHY_CLOCK_MODE;
-    config.tcpip_input = pkt_eth2wifi;
-    config.promiscuous_enable = true;
-#ifdef CONFIG_EXAMPLE_PHY_USE_POWER_PIN
-    /* Replace the default 'power enable' function with an example-specific one that toggles a power GPIO. */
-    config.phy_power_enable = phy_device_power_enable_via_gpio;
-#endif
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_eth_init_internal(&config));
-    ESP_ERROR_CHECK(esp_eth_enable());
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&mac_config);
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+#if CONFIG_EXAMPLE_ETH_PHY_IP101
+    esp_eth_phy_t *phy = esp_eth_phy_new_ip101(&phy_config);
+#elif CONFIG_EXAMPLE_ETH_PHY_RTL8201
+    esp_eth_phy_t *phy = esp_eth_phy_new_rtl8201(&phy_config);
+#elif CONFIG_EXAMPLE_ETH_PHY_LAN8720
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan8720(&phy_config);
+#elif CONFIG_EXAMPLE_ETH_PHY_DP83848
+    esp_eth_phy_t *phy = esp_eth_phy_new_dp83848(&phy_config);
+#endif
+    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    config.stack_input = pkt_eth2wifi;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &s_eth_handle));
+    esp_eth_ioctl(s_eth_handle, ETH_CMD_S_PROMISCUOUS, (void *)true);
 }
 
 static void initialize_wifi(void)
 {
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init_internal(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     wifi_config_t wifi_config = {
