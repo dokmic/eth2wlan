@@ -1,0 +1,10 @@
+services:
+  idf:
+    image: espressif/idf:latest
+    environment:
+      - ESPPORT=/dev/ttyAMA0
+      - ESPBAUD=115200
+    volumes:
+      - .:/app
+      - /dev/ttyAMA0:/dev/ttyAMA0
+    working_dir: /app
